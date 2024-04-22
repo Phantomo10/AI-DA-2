@@ -1,0 +1,90 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchtext.legacy import data
+from torchtext.legacy import datasets
+import random
+
+# Set random seeds for reproducibility
+SEED = 1234
+torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+
+# Define fields for preprocessing
+TEXT = data.Field(tokenize='spacy', include_lengths=True)
+LABEL = data.LabelField(dtype=torch.float)
+
+# Load the IMDb dataset
+train_data, test_data = datasets.IMDB.splits(TEXT, LABEL)
+
+# Build vocabulary
+MAX_VOCAB_SIZE = 25000
+TEXT.build_vocab(train_data, max_size=MAX_VOCAB_SIZE)
+LABEL.build_vocab(train_data)
+
+# Create iterators
+BATCH_SIZE = 64
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+train_iterator, test_iterator = data.BucketIterator.splits(
+    (train_data, test_data), 
+    batch_size=BATCH_SIZE,
+    sort_within_batch=True,
+    device=device)
+
+# Define RNN model
+class RNN(nn.Module):
+    def __init__(self, input_dim, embedding_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(input_dim, embedding_dim)
+        self.rnn = nn.RNN(embedding_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, text, text_lengths):
+        embedded = self.embedding(text)
+        packed_embedded = nn.utils.rnn.pack_padded_sequence(embedded, text_lengths.to('cpu'))
+        packed_output, hidden = self.rnn(packed_embedded)
+        output, output_lengths = nn.utils.rnn.pad_packed_sequence(packed_output)
+        return self.fc(hidden.squeeze(0))
+
+# Instantiate the model
+INPUT_DIM = len(TEXT.vocab)
+EMBEDDING_DIM = 100
+HIDDEN_DIM = 256
+OUTPUT_DIM = 1
+model = RNN(INPUT_DIM, EMBEDDING_DIM, HIDDEN_DIM, OUTPUT_DIM)
+
+# Define optimizer and loss function
+optimizer = optim.SGD(model.parameters(), lr=1e-3)
+criterion = nn.BCEWithLogitsLoss()
+
+# Move model and criterion to device
+model = model.to(device)
+criterion = criterion.to(device)
+
+# Train the model
+def train(model, iterator, optimizer, criterion):
+    model.train()
+    for batch in iterator:
+        text, text_lengths = batch.text
+        optimizer.zero_grad()
+        predictions = model(text, text_lengths).squeeze(1)
+        loss = criterion(predictions, batch.label)
+        loss.backward()
+        optimizer.step()
+
+train(model, train_iterator, optimizer, criterion)
+
+# Evaluate the model
+def evaluate(model, iterator, criterion):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in iterator:
+            text, text_lengths = batch.text
+            predictions = model(text, text_lengths).squeeze(1)
+            loss = criterion(predictions, batch.label)
+            total_loss += loss.item()
+    return total_loss / len(iterator)
+
+test_loss = evaluate(model, test_iterator, criterion)
+print(f'Test Loss: {test_loss:.3f}')
